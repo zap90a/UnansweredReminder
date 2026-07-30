@@ -33,7 +33,7 @@ except ImportError:
 
 
 NAME = "UnansweredReminder"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DESCRIPTION = "⏰ Неотвеченные диалоги → напоминание в Telegram. /list — список (прописывать перед 1 использованием), /cleanup — очистка"
 CREDITS = "@zap90a"
 UUID = "0f664d34-ddd9-418e-988a-ac834b3e397c"
@@ -583,24 +583,23 @@ def _check_loop() -> None:
     while not _stop_event.is_set():
         try:
             if _config.get("enabled", True):
-                _check_dialogs(first_pass)
-            if first_pass:
-                first_pass = False
-                logger.info("[UnansweredReminder] Первая проверка завершена")
+                if _check_dialogs(first_pass) and first_pass:
+                    first_pass = False
+                    logger.info("[UnansweredReminder] Первая проверка завершена")
         except Exception as exc:
             logger.error(f"[UnansweredReminder] Ошибка в цикле: {exc}")
         _stop_event.wait(CHECK_INTERVAL_SEC)
     logger.info("[UnansweredReminder] Цикл проверки остановлен")
 
 
-def _check_dialogs(first_pass: bool) -> None:
+def _check_dialogs(first_pass: bool) -> bool:
     dialogs = _get_dialogs()
     logger.info(
         f"[UnansweredReminder] _check_dialogs: {len(dialogs)} диалогов, first_pass={first_pass}")
     if not dialogs:
         logger.debug(
             "[UnansweredReminder] _get_dialogs() вернул пустой список")
-        return
+        return False
     now = _now_utc()
     ignored = _ignored_set()
     buyers = sellers = systems = unknowns = excluded = 0
@@ -615,16 +614,8 @@ def _check_dialogs(first_pass: bool) -> None:
                     _process_buyer_chat(cid, {}, now, first_pass)
                 elif ls == "seller":
                     sellers += 1
-                elif first_pass and cid not in _state.get("last_sender", {}):
-                    _set_chat(cid, "buyer", now)
-                    _save_state()
-                    buyers += 1
-                    logger.info(
-                        f"[UnansweredReminder] начат отслеживание диалога {cid} (первый проход)")
-                    uname = _fetch_dialog_username(cid)
-                    if uname:
-                        _state.setdefault("usernames", {})[cid] = uname
-                        _save_state()
+                elif first_pass:
+                    pass
                 else:
                     unknowns += 1
             else:
@@ -660,6 +651,7 @@ def _check_dialogs(first_pass: bool) -> None:
     if buyers or sellers or systems or unknowns or excluded:
         logger.info(f"[UnansweredReminder] Статистика: buyers={buyers}, sellers={sellers}, "
                     f"systems={systems}, unknown={unknowns}, excluded={excluded}")
+    return True
 
 
 def _process_buyer_chat(chat_id: str, dialog: dict, now: datetime, first_pass: bool) -> None:
@@ -1278,18 +1270,41 @@ def on_new_message(cardinal: Any, event: Any) -> None:
                 else:
                     t = str(_safe_attr(msg, "sender_type")
                             or _safe_attr(msg, "type") or "").lower()
-                if t in ("system", "service", "system_message"):
+
+                # Извлекаем имя из всех возможных источников для классификации
+                nm = ""
+                if isinstance(msg, dict):
+                    nm = str(msg.get("sender_name") or msg.get("name") or "").lower()
+                if not nm:
+                    nm = str(_safe_attr(msg, "sender_name") or _safe_attr(msg, "name") or "").lower()
+                if not nm:
+                    user = _safe_get(event, "user")
+                    if isinstance(user, dict):
+                        nm = str(user.get("username") or user.get("name") or "").lower()
+                    elif user is not None:
+                        nm = str(_safe_attr(user, "username") or _safe_attr(user, "name") or "").lower()
+                if not nm:
+                    if isinstance(event, dict):
+                        nm = str(event.get("username") or event.get("name") or event.get("sender_name") or "").lower()
+                    else:
+                        nm = str(_safe_attr(event, "username") or _safe_attr(event, "name") or _safe_attr(event, "sender_name") or "").lower()
+
+                if t in ("system", "service", "system_message", "info", "funpay"):
                     sender = "system"
-                elif t in ("buyer", "user", "customer"):
+                elif nm in ("funpay", "system", "support", "бот", "bot", "service", "admin", "info"):
+                    sender = "system"
+                elif t in ("buyer", "user", "customer", "message", "text", "chat"):
                     sender = "buyer"
+                elif t in ("support", "seller", "staff", "admin"):
+                    sender = "seller"
+                elif not t:
+                    sender = "unknown"
                 else:
                     sender = "buyer"
 
         if sender == "buyer":
-            _reset_chat_timer(chat_id)
+            uname = None
             try:
-                uname = None
-
                 user = _safe_get(event, "user")
                 if user:
                     if isinstance(user, dict):
@@ -1321,7 +1336,6 @@ def on_new_message(cardinal: Any, event: Any) -> None:
                                     break
                         if uname:
                             break
-
                 if not uname:
                     data = _safe_get(event, "data")
                     if data:
@@ -1342,7 +1356,6 @@ def on_new_message(cardinal: Any, event: Any) -> None:
                                         break
                             if uname:
                                 break
-
                 if not uname:
                     for attr in ("username", "user_name", "sender_name",
                                  "name", "chat_name", "buyer_name", "seller_name", "nickname"):
@@ -1353,7 +1366,6 @@ def on_new_message(cardinal: Any, event: Any) -> None:
                         if v:
                             uname = str(v)
                             break
-
                 if not uname:
                     if isinstance(msg, dict):
                         for k in ("username", "user_name", "sender_name", "name", "buyer_name", "nickname"):
@@ -1402,7 +1414,6 @@ def on_new_message(cardinal: Any, event: Any) -> None:
                                             break
                                 if uname:
                                     break
-
                 if not uname:
                     data = _safe_get(msg, "data")
                     if data:
@@ -1424,33 +1435,38 @@ def on_new_message(cardinal: Any, event: Any) -> None:
                             if uname:
                                 break
 
-                if uname:
-                    _state.setdefault("usernames", {})[chat_id] = str(uname)
-                    _save_state()
+                if uname and uname.lower() in ("funpay", "system", "service", "support", "бот", "bot", "admin"):
                     logger.info(
-                        f"[UnansweredReminder] ✅ Сохранено имя для чата {chat_id}: {uname}")
+                        f"[UnansweredReminder] системное имя '{uname}' — не buyer")
                 else:
-                    ev_type = type(event).__name__
-                    ev_id = id(event)
-                    try:
-                        ev_dir = str(
-                            [a for a in dir(event) if not a.startswith('_')][:15])
-                    except Exception:
-                        ev_dir = "?dir?"
-                    msg_type = type(msg).__name__
-                    try:
-                        msg_repr = repr(msg)[:200]
-                    except Exception:
-                        msg_repr = "?repr?"
+                    if uname:
+                        _state.setdefault("usernames", {})[chat_id] = str(uname)
+                        _save_state()
+                        logger.info(
+                            f"[UnansweredReminder] ✅ Сохранено имя для чата {chat_id}: {uname}")
+                    else:
+                        ev_type = type(event).__name__
+                        try:
+                            ev_dir = str(
+                                [a for a in dir(event) if not a.startswith('_')][:15])
+                        except Exception:
+                            ev_dir = "?dir?"
+                        msg_type = type(msg).__name__
+                        try:
+                            msg_repr = repr(msg)[:200]
+                        except Exception:
+                            msg_repr = "?repr?"
+                        logger.info(
+                            f"[UnansweredReminder] ❌ НЕ удалось извлечь имя для чата {chat_id}: "
+                            f"event={ev_type}, attrs={ev_dir}, "
+                            f"msg_type={msg_type}, msg={msg_repr}")
+
+                    _reset_chat_timer(chat_id)
                     logger.info(
-                        f"[UnansweredReminder] ❌ НЕ удалось извлечь имя для чата {chat_id}: "
-                        f"event={ev_type}(id={ev_id}), attrs={ev_dir}, "
-                        f"msg_type={msg_type}, msg={msg_repr}")
+                        f"[UnansweredReminder] Сообщение от покупателя в {chat_id} — таймер сброшен")
             except Exception as e:
                 logger.warning(
-                    f"[UnansweredReminder] Ошибка сохранения имени: {e}")
-            logger.info(
-                f"[UnansweredReminder] Сообщение от покупателя в {chat_id} — таймер сброшен")
+                    f"[UnansweredReminder] Ошибка обработки сообщения: {e}")
         elif sender == "seller":
             _mark_answered(chat_id)
             logger.info(
